@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -17,6 +16,12 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+
+	"github.com/sanketny8/ai-gateway-microservices/pkg/cache"
+	"github.com/sanketny8/ai-gateway-microservices/pkg/middleware"
+	"github.com/sanketny8/ai-gateway-microservices/pkg/providers"
+	"github.com/sanketny8/ai-gateway-microservices/pkg/ratelimit"
+	"github.com/sanketny8/ai-gateway-microservices/pkg/router"
 )
 
 func main() {
@@ -31,24 +36,53 @@ func main() {
 		}
 	}()
 
+	// Initialize cache
+	redisCache, err := cache.NewRedisCache(
+		getEnv("REDIS_ADDR", "localhost:6379"),
+		getEnv("REDIS_PASSWORD", ""),
+		0,
+		5*time.Minute,
+	)
+	if err != nil {
+		log.Printf("Warning: Redis cache disabled: %v", err)
+		redisCache = nil
+	}
+
+	// Initialize rate limiter (100 requests per user per minute)
+	rateLimiter := ratelimit.NewRateLimiter(100, 100.0/60.0)
+
+	// Initialize router
+	gwRouter := router.NewRouter(redisCache, rateLimiter)
+
+	// Register providers
+	if openaiKey := os.Getenv("OPENAI_API_KEY"); openaiKey != "" {
+		gwRouter.RegisterProvider("openai", providers.NewOpenAIProvider(openaiKey))
+		log.Println("✓ OpenAI provider registered")
+	}
+	if anthropicKey := os.Getenv("ANTHROPIC_API_KEY"); anthropicKey != "" {
+		gwRouter.RegisterProvider("anthropic", providers.NewAnthropicProvider(anthropicKey))
+		log.Println("✓ Anthropic provider registered")
+	}
+
 	// Create Gin router
-	router := gin.Default()
+	ginRouter := gin.Default()
 
 	// Middleware
-	router.Use(gin.Recovery())
-	router.Use(gin.Logger())
+	ginRouter.Use(gin.Recovery())
+	ginRouter.Use(middleware.TracingMiddleware())
+	ginRouter.Use(middleware.MetricsMiddleware())
 
 	// Health endpoints
-	router.GET("/health", healthCheck)
-	router.GET("/ready", readinessCheck)
+	ginRouter.GET("/health", healthCheck)
+	ginRouter.GET("/ready", readinessCheck)
 
 	// Prometheus metrics
-	router.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	ginRouter.GET("/metrics", gin.WrapH(promhttp.Handler()))
 
 	// API v1 routes
-	v1 := router.Group("/v1")
+	v1 := ginRouter.Group("/v1")
 	{
-		v1.POST("/chat/completions", handleChatCompletions)
+		v1.POST("/chat/completions", gwRouter.HandleChatCompletion)
 		v1.POST("/embeddings", handleEmbeddings)
 		v1.GET("/usage", handleUsage)
 	}
@@ -56,9 +90,9 @@ func main() {
 	// Start server
 	srv := &http.Server{
 		Addr:           ":8080",
-		Handler:        router,
-		ReadTimeout:    30 * time.Second,
-		WriteTimeout:   30 * time.Second,
+		Handler:        ginRouter,
+		ReadTimeout:    60 * time.Second,
+		WriteTimeout:   60 * time.Second,
 		MaxHeaderBytes: 1 << 20,
 	}
 
@@ -69,7 +103,7 @@ func main() {
 		}
 	}()
 
-	log.Println("Server started on :8080")
+	log.Println("🚀 AI Gateway started on :8080")
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -81,6 +115,10 @@ func main() {
 
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatal("Server forced to shutdown:", err)
+	}
+
+	if redisCache != nil {
+		redisCache.Close()
 	}
 
 	log.Println("Server exited")
@@ -117,34 +155,6 @@ func readinessCheck(c *gin.Context) {
 	})
 }
 
-func handleChatCompletions(c *gin.Context) {
-	var req map[string]interface{}
-	if err := c.BindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Route to appropriate provider, handle caching, etc.
-	response := map[string]interface{}{
-		"id":      "chatcmpl-123",
-		"object":  "chat.completion",
-		"created": time.Now().Unix(),
-		"model":   req["model"],
-		"choices": []map[string]interface{}{
-			{
-				"index": 0,
-				"message": map[string]string{
-					"role":    "assistant",
-					"content": "This is a sample response from the AI gateway.",
-				},
-				"finish_reason": "stop",
-			},
-		},
-	}
-
-	c.JSON(http.StatusOK, response)
-}
-
 func handleEmbeddings(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"object": "list",
@@ -153,9 +163,22 @@ func handleEmbeddings(c *gin.Context) {
 }
 
 func handleUsage(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		userID = "anonymous"
+	}
+
 	c.JSON(http.StatusOK, gin.H{
+		"user_id":     userID,
 		"tokens_used": 12345,
 		"requests":    100,
 		"cost":        5.67,
 	})
+}
+
+func getEnv(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
 }
